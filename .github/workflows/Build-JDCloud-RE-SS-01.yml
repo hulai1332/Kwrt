@@ -1,0 +1,117 @@
+name: Build JDCloud RE-SS-01 Clean 2G
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: JDCloud RE-SS-01 / clean / 2G
+    runs-on: ubuntu-24.04
+
+    env:
+      TARGET: qualcommax_ipq60xx
+      REPO_TOKEN: ${{ secrets.TOKEN_KIDDIN9 }}
+
+    steps:
+      - name: Checkout Kwrt
+        uses: actions/checkout@v4
+        with:
+          ref: 25.12
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget dwarves \
+            llvm python3-pyelftools libpython3-dev aria2 jq qemu-utils ccache \
+            rename libelf-dev device-tree-compiler libgmp-dev libmpc-dev \
+            libfuse-dev
+
+      - name: Clone OpenWrt 25.12 source
+        run: |
+          git clone --depth=1 -b openwrt-25.12 https://github.com/openwrt/openwrt.git openwrt
+
+      - name: Apply Kwrt common and RE-SS-01 customization
+        working-directory: openwrt
+        run: |
+          set -eux
+
+          cp -rf ../devices/common/. .
+          cp -rf ../devices/${TARGET}/. .
+          cp -rf ../devices .
+
+          git_clone_path() {
+            branch="$1"
+            rurl="$2"
+            shift 2
+            rootdir="$PWD"
+            tmpdir="$(mktemp -d)"
+            trap 'rm -rf "$tmpdir"' RETURN
+
+            if [ ${#branch} -lt 10 ]; then
+              git clone -b "$branch" --depth 1 --filter=blob:none --sparse "$rurl" "$tmpdir"
+            else
+              git clone --filter=blob:none --sparse "$rurl" "$tmpdir"
+              git -C "$tmpdir" checkout "$branch"
+            fi
+
+            git -C "$tmpdir" sparse-checkout init --cone
+            git -C "$tmpdir" sparse-checkout set "$@"
+            cp -rn "$tmpdir"/* "$rootdir"/
+            rm -rf "$tmpdir"
+            trap - RETURN
+          }
+          export -f git_clone_path
+
+          chmod +x devices/common/diy.sh
+          REPO_TOKEN="${REPO_TOKEN:-}" TARGET="${TARGET}" /bin/bash devices/common/diy.sh
+
+          cp -f devices/common/.config .config
+          cat devices/${TARGET}/.config >> .config
+
+          chmod +x devices/${TARGET}/diy.sh
+          /bin/bash devices/${TARGET}/diy.sh
+
+          cp -Rf ./diy/* ./ || true
+
+      - name: Defconfig and verify profile
+        working-directory: openwrt
+        run: |
+          set -eux
+          make defconfig
+
+          echo '===== TARGET ====='
+          grep -E 'CONFIG_TARGET_(qualcommax|qualcommax_ipq60xx|TARGET_ROOTFS_PARTSIZE)' .config || true
+          echo '===== DEVICE ====='
+          grep 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01=' .config
+          echo '===== ROOTFS SIZE ====='
+          grep 'CONFIG_TARGET_ROOTFS_PARTSIZE=' .config
+          echo '===== OPTIONAL LUCI APPS ====='
+          if grep -E '^CONFIG_PACKAGE_luci-app-[^=]+=(y|m)$' .config; then
+            echo 'ERROR: optional luci-app package selected'
+            exit 1
+          fi
+
+      - name: Compile firmware
+        working-directory: openwrt
+        run: |
+          set -eux
+          make download -j$(nproc)
+          make -j$(nproc) V=s
+
+      - name: Show firmware files
+        run: |
+          find openwrt/bin/targets/qualcommax/ipq60xx -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JDCloud-RE-SS-01-clean-2G
+          path: openwrt/bin/targets/qualcommax/ipq60xx/
+          if-no-files-found: error
+          retention-days: 14

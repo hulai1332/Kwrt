@@ -1,4 +1,4 @@
-name: Build JDCloud RE-SS-01 Clean 2G
+name: Build JDCloud RE-SS-01 Clean
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: JDCloud RE-SS-01 / clean / 2G
+    name: JDCloud RE-SS-01 / clean
     runs-on: ubuntu-24.04
 
     steps:
@@ -36,21 +36,12 @@ jobs:
         working-directory: openwrt
         run: |
           set -eux
-
-          # Do NOT run devices/common/diy.sh here. It adds Kiddin9 default
-          # plugins and calls the Kiddin9 GitHub API with TOKEN_KIDDIN9.
-          # This clean build is intentionally independent of that service.
-
           cp -rf ../devices/qualcommax_ipq60xx/. ./device-config
 
           git_clone_path() {
             trap 'rm -rf "$tmpdir"' RETURN
             branch="$1"; rurl="$2"; mv_mode="$3"
-            if [ "$mv_mode" = "mv" ]; then
-              shift 3
-            else
-              shift 2
-            fi
+            if [ "$mv_mode" = "mv" ]; then shift 3; else shift 2; fi
             rootdir="$PWD"
             tmpdir="$(mktemp -d)"
             if [ ${#branch} -lt 10 ]; then
@@ -81,7 +72,6 @@ jobs:
         working-directory: openwrt
         run: |
           set -eux
-
           cat > .config <<'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq60xx=y
@@ -89,12 +79,6 @@ jobs:
           CONFIG_TARGET_MULTI_PROFILE=n
           CONFIG_TARGET_ALL_PROFILES=n
 
-          # 2 GiB rootfs target; the installed 2 GiB GPT layout provides the
-          # matching persistent eMMC space used by the reference RE-SS-01.
-          CONFIG_TARGET_ROOTFS_PARTSIZE=2048
-          CONFIG_TARGET_ROOTFS_EXT4FS=n
-
-          # Clean base system + LuCI only.
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_PACKAGE_luci-base=y
@@ -103,11 +87,6 @@ jobs:
           CONFIG_LUCI_LANG_zh_Hans=y
           CONFIG_LUCI_LANG_en=y
 
-          # eMMC/F2FS support.
-          CONFIG_PACKAGE_kmod-fs-f2fs=y
-          CONFIG_PACKAGE_f2fs-tools=y
-
-          # Basic router services.
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_firewall4=y
           CONFIG_PACKAGE_dropbear=y
@@ -115,35 +94,7 @@ jobs:
           CONFIG_PACKAGE_odhcpd-ipv6only=y
           CONFIG_PACKAGE_ca-bundle=y
           CONFIG_PACKAGE_zoneinfo-asia=y
-
-          # No optional LuCI applications / proxy cores.
-          CONFIG_PACKAGE_luci-app-advancedplus=n
-          CONFIG_PACKAGE_luci-app-firewall=n
-          CONFIG_PACKAGE_luci-app-package-manager=n
-          CONFIG_PACKAGE_luci-app-upnp=n
-          CONFIG_PACKAGE_luci-app-syscontrol=n
-          CONFIG_PACKAGE_luci-app-wizard=n
-          CONFIG_PACKAGE_luci-app-fan=n
-          CONFIG_PACKAGE_luci-app-filemanager=n
-          CONFIG_PACKAGE_luci-app-wifihistory=n
-          CONFIG_PACKAGE_luci-app-store=n
-          CONFIG_PACKAGE_luci-app-ttyd=n
-          CONFIG_PACKAGE_luci-app-homeproxy=n
-          CONFIG_PACKAGE_luci-app-mosdns=n
-          CONFIG_PACKAGE_luci-app-adguardhome=n
-          CONFIG_PACKAGE_luci-app-openclash=n
-          CONFIG_PACKAGE_luci-app-passwall=n
-          CONFIG_PACKAGE_luci-app-passwall2=n
-          CONFIG_PACKAGE_xray-core=n
-          CONFIG_PACKAGE_sing-box=n
-          CONFIG_PACKAGE_hysteria=n
           EOF
-
-          make defconfig
-
-          # Remove any optional luci-app selections introduced by dependencies
-          # or the imported Kwrt device layer, then regenerate the config.
-          sed -i -E 's/^CONFIG_PACKAGE_luci-app-[^=]+=(y|m)$/CONFIG_PACKAGE_\1=n/' .config || true
           make defconfig
 
       - name: Set LAN address to 192.168.20.1
@@ -153,12 +104,10 @@ jobs:
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-jdcloud-re-ss-01-clean <<'EOF'
           #!/bin/sh
-          if uci -q get network.lan >/dev/null 2>&1; then
-              uci set network.lan.proto='static'
-              uci set network.lan.ipaddr='192.168.20.1'
-              uci set network.lan.netmask='255.255.255.0'
-              uci commit network
-          fi
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.20.1'
+          uci set network.lan.netmask='255.255.255.0'
+          uci commit network
           uci set system.@system[0].hostname='JDCloud-AX1800-Pro'
           uci set system.@system[0].zonename='Asia/Shanghai'
           uci set system.@system[0].timezone='CST-8'
@@ -167,20 +116,15 @@ jobs:
           EOF
           chmod +x files/etc/uci-defaults/99-jdcloud-re-ss-01-clean
 
-      - name: Verify profile and clean package selection
+      - name: Verify clean profile
         working-directory: openwrt
         run: |
           set -eux
-          echo '===== TARGET ====='
-          grep -E 'CONFIG_TARGET_(qualcommax|qualcommax_ipq60xx|ROOTFS_PARTSIZE)' .config
-          echo '===== DEVICE ====='
-          grep 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01=' .config
-          echo '===== OPTIONAL LUCI APPS ====='
+          grep 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01=y' .config
           if grep -E '^CONFIG_PACKAGE_luci-app-[^=]+=(y|m)$' .config; then
-            echo 'ERROR: optional luci-app package selected'
+            echo 'ERROR: optional luci-app selected'
             exit 1
           fi
-          echo '===== PROXY CORES ====='
           if grep -E '^CONFIG_PACKAGE_(xray-core|sing-box|hysteria)=(y|m)$' .config; then
             echo 'ERROR: proxy core selected'
             exit 1
@@ -195,13 +139,12 @@ jobs:
         run: make -j$(nproc) V=s
 
       - name: Show firmware files
-        run: |
-          find openwrt/bin/targets/qualcommax/ipq60xx -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+        run: find openwrt/bin/targets/qualcommax/ipq60xx -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JDCloud-RE-SS-01-clean-2G
+          name: JDCloud-RE-SS-01-clean
           path: openwrt/bin/targets/qualcommax/ipq60xx/
           if-no-files-found: error
           retention-days: 14

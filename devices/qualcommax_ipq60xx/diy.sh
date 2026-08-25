@@ -23,53 +23,60 @@ rm -rf package/nss-packages/nss-userspace-oss
 sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" target/linux/qualcommax/Makefile
 
 # ==========================================================
-# JDCloud RE-SS-01 / 亚瑟
+# JDCloud RE-SS-01 / 亚瑟：纯净配置
 # ==========================================================
-# RE-SS-01 使用 eMMC。这里把官方设备定义切换到 EmmcImage，
-# 并加入 F2FS 支持；2G Overlay 本身依赖刷入匹配的 2G GPT。
-# 这不会修改你现有设备的 GPT，也不会把其它 eMMC 分区写入 factory 镜像。
+# 上游 LiBwrt 的 ipq60xx.mk 已经包含正确的
+# Device/jdcloud_re-ss-01 + Device/EmmcImage 定义。
+# 不在这里二次改 image 定义，避免与上游设备定义冲突。
+#
+# 2 GiB rootfs/overlay 的大小由本设备 .config 中的
+# CONFIG_TARGET_ROOTFS_PARTSIZE=2048 控制；实际 eMMC 分区表
+# 仍需与已经验证的 2 GiB GPT 布局匹配。
 # ==========================================================
 
-python3 - <<'PY'
-from pathlib import Path
+# Kwrt common/diy.sh 会把一批 luci-app-* 写进 DEFAULT_PACKAGES。
+# 本配置要求“无插件”，因此在 target 层把这些第三方/可选 LuCI
+# 应用从默认包列表中移除；基础 luci/luci-ssl 仍由 .config 保留。
+if [ -f include/target.mk ]; then
+    sed -i -E 's/ ?luci-app-[^ ]+//g' include/target.mk
+fi
 
-p = Path('target/linux/qualcommax/image/ipq60xx.mk')
-s = p.read_text()
-old = '''define Device/jdcloud_re-ss-01
-\t$(call Device/FitImage)
-\tDEVICE_VENDOR := JDCloud
-\tDEVICE_MODEL := RE-SS-01
-\tSOC := ipq6000
-\tBLOCKSIZE := 64k
-\tKERNEL_SIZE := 6144k
-\tDEVICE_DTS_CONFIG := config@cp03-c2
-\tDEVICE_PACKAGES := ipq-wifi-jdcloud_re-ss-01
-endef
-TARGET_DEVICES += jdcloud_re-ss-01'''
-new = '''define Device/jdcloud_re-ss-01
-\t$(call Device/FitImage)
-\t$(call Device/EmmcImage)
-\tDEVICE_VENDOR := JDCloud
-\tDEVICE_MODEL := RE-SS-01
-\tSOC := ipq6000
-\tBLOCKSIZE := 64k
-\tKERNEL_SIZE := 6144k
-\tDEVICE_DTS_CONFIG := config@cp03-c2
-\tDEVICE_PACKAGES := ipq-wifi-jdcloud_re-ss-01 kmod-fs-f2fs f2fs-tools
-endef
-TARGET_DEVICES += jdcloud_re-ss-01'''
+# 清掉可能由 feeds 默认配置拉入的常见第三方插件选择；
+# 不删除驱动、NSS、LuCI 基础组件或系统必需包。
+cat >> .config <<'EOF'
 
-if old not in s:
-    raise SystemExit('JDCloud RE-SS-01 image definition not found; aborting instead of guessing.')
-p.write_text(s.replace(old, new, 1))
-PY
+# JDCloud RE-SS-01 clean profile: no optional LuCI applications
+CONFIG_PACKAGE_luci-app-advancedplus=n
+CONFIG_PACKAGE_luci-app-firewall=n
+CONFIG_PACKAGE_luci-app-package-manager=n
+CONFIG_PACKAGE_luci-app-upnp=n
+CONFIG_PACKAGE_luci-app-syscontrol=n
+CONFIG_PACKAGE_luci-app-wizard=n
+CONFIG_PACKAGE_luci-app-fan=n
+CONFIG_PACKAGE_luci-app-filemanager=n
+CONFIG_PACKAGE_luci-app-wifihistory=n
+CONFIG_PACKAGE_luci-app-store=n
+CONFIG_PACKAGE_luci-app-ttyd=n
+CONFIG_PACKAGE_luci-app-homeproxy=n
+CONFIG_PACKAGE_luci-app-mosdns=n
+CONFIG_PACKAGE_luci-app-adguardhome=n
+CONFIG_PACKAGE_luci-app-openclash=n
+CONFIG_PACKAGE_luci-app-passwall=n
+CONFIG_PACKAGE_luci-app-passwall2=n
 
-# 固定 LAN 为 192.168.20.1，不覆盖 target 自己生成的网口布局。
+# 不要把代理核心作为默认插件带入
+CONFIG_PACKAGE_xray-core=n
+CONFIG_PACKAGE_sing-box=n
+CONFIG_PACKAGE_hysteria=n
+
+# 保证 LAN 默认地址由本设备专用 UCI defaults 固定
+EOF
+
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-jdcloud-re-ss-01-clean <<'EOF'
 #!/bin/sh
 
-# 只修改 LAN 地址，保留设备 target 原本的 WAN/LAN 端口定义。
+# 只修改 LAN 地址，保留 target 自己生成的 WAN/LAN 端口布局。
 if uci -q get network.lan >/dev/null 2>&1; then
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr='192.168.20.1'
@@ -86,6 +93,3 @@ uci commit system
 exit 0
 EOF
 chmod +x files/etc/uci-defaults/99-jdcloud-re-ss-01-clean
-
-# 明确不选择任何第三方插件；插件仓库可以存在，但不会进入最终固件。
-# 保留 NSS 源码以维持 Kwrt 的 Qualcomm/NSS 基础支持。

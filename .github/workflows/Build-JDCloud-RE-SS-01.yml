@@ -45,26 +45,35 @@ jobs:
           cp -rf ../devices/${TARGET}/. .
           cp -rf ../devices .
 
+          # Compatible with Kwrt common/diy.sh: supports both copy mode and
+          # the "mv <path>" form used for the generic 6.12 hack tree.
           git_clone_path() {
-            branch="$1"
-            rurl="$2"
-            shift 2
-            rootdir="$PWD"
-            tmpdir="$(mktemp -d)"
             trap 'rm -rf "$tmpdir"' RETURN
+            branch="$1" rurl="$2" mv="$3"
+            [[ "$mv" != "mv" ]] && shift 2 || shift 3
+            rootdir="$PWD"
+            tmpdir="$(mktemp -d)" || exit 1
 
             if [ ${#branch} -lt 10 ]; then
               git clone -b "$branch" --depth 1 --filter=blob:none --sparse "$rurl" "$tmpdir"
+              cd "$tmpdir"
             else
               git clone --filter=blob:none --sparse "$rurl" "$tmpdir"
-              git -C "$tmpdir" checkout "$branch"
+              cd "$tmpdir"
+              git checkout "$branch"
             fi
 
-            git -C "$tmpdir" sparse-checkout init --cone
-            git -C "$tmpdir" sparse-checkout set "$@"
-            cp -rn "$tmpdir"/* "$rootdir"/
-            rm -rf "$tmpdir"
-            trap - RETURN
+            git sparse-checkout init --cone
+            git sparse-checkout set "$@"
+
+            if [[ "$mv" != "mv" ]]; then
+              cp -rn ./* "$rootdir"/
+            else
+              mkdir -p "$rootdir/$@"
+              mv -n "$@"/* "$rootdir/$@"/
+            fi
+
+            cd "$rootdir"
           }
           export -f git_clone_path
 
@@ -86,7 +95,7 @@ jobs:
           make defconfig
 
           echo '===== TARGET ====='
-          grep -E 'CONFIG_TARGET_(qualcommax|qualcommax_ipq60xx|TARGET_ROOTFS_PARTSIZE)' .config || true
+          grep -E 'CONFIG_TARGET_(qualcommax|qualcommax_ipq60xx|ROOTFS_PARTSIZE)' .config || true
           echo '===== DEVICE ====='
           grep 'CONFIG_TARGET_qualcommax_ipq60xx_DEVICE_jdcloud_re-ss-01=' .config
           echo '===== ROOTFS SIZE ====='

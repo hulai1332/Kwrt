@@ -26,23 +26,66 @@ sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" ta
 # JDCloud RE-SS-01 / 亚瑟：纯净配置
 # ==========================================================
 # 上游 LiBwrt 的 ipq60xx.mk 已经包含正确的
-# Device/jdcloud_re-ss-01 + Device/EmmcImage 定义。
-# 不在这里二次改 image 定义，避免与上游设备定义冲突。
-#
-# 2 GiB rootfs/overlay 的大小由本设备 .config 中的
-# CONFIG_TARGET_ROOTFS_PARTSIZE=2048 控制；实际 eMMC 分区表
-# 仍需与已经验证的 2 GiB GPT 布局匹配。
+# Device/jdcloud_re-ss-01 + Device/FitImage 定义。
+# RE-SS-01 是 eMMC 双启动槽位设备，sysupgrade 必须写入
+# 当前非活动槽位，并由 0:BOOTCONFIG 的 byte 148 决定目标槽位。
+# 这里强制使用 OpenWrt 已验证的 mmc_do_upgrade 路径，避免
+# 直接写当前 HLOS 后重启又回到旧系统。
 # ==========================================================
 
-# Kwrt common/diy.sh 会把一批 luci-app-* 写进 DEFAULT_PACKAGES。
-# 本配置要求“无插件”，因此在 target 层把这些第三方/可选 LuCI
-# 应用从默认包列表中移除；基础 luci/luci-ssl 仍由 .config 保留。
+PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
+python3 - "$PLATFORM_SH" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+new_case = '''\tjdcloud,re-cs-02|\\
+\tjdcloud,re-cs-07|\\
+\tjdcloud,re-ss-01|\\
+\tlink,nn6000-v1|\\
+\tlink,nn6000-v2)
+\t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
+\t\t[ -n "$cfgpart" ] || return 1
+
+\t\tpart_num="$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$cfgpart" | cut -f 1 -d "|" | head -n1)"
+\t\tif [ "$part_num" -eq "1" ]; then
+\t\t\tCI_KERNPART="0:HLOS_1"
+\t\t\tCI_ROOTPART="rootfs_1"
+\t\telse
+\t\t\tCI_KERNPART="0:HLOS"
+\t\t\tCI_ROOTPART="rootfs"
+\t\tfi
+
+\t\tEMMC_KERN_DEV="$(find_mmc_part "$CI_KERNPART" "$CI_ROOTDEV")"
+\t\tEMMC_ROOT_DEV="$(find_mmc_part "$CI_ROOTPART" "$CI_ROOTDEV")"
+\t\temmc_do_upgrade "$1"
+\t\t;;'''
+
+pattern = re.compile(
+    r'(?m)^\tjdcloud,re-cs-02\|\\\n.*?^\t\temmc_do_upgrade "\$1"\n\t\t;;',
+    re.S,
+)
+
+m = pattern.search(text)
+if not m:
+    raise SystemExit("ERROR: RE-SS-01 eMMC upgrade case not found in platform.sh")
+
+text = text[:m.start()] + new_case + text[m.end():]
+path.write_text(text)
+PY
+
+# Sanity-check the generated upgrade handler during the build.
+grep -A25 -B2 'jdcloud,re-cs-02' "$PLATFORM_SH"
+
+# Kwrt common/diy.sh can add optional luci-app-* entries to DEFAULT_PACKAGES.
+# This profile is intentionally clean: keep base LuCI, remove optional apps.
 if [ -f include/target.mk ]; then
     sed -i -E 's/ ?luci-app-[^ ]+//g' include/target.mk
 fi
 
-# 清掉可能由 feeds 默认配置拉入的常见第三方插件选择；
-# 不删除驱动、NSS、LuCI 基础组件或系统必需包。
 cat >> .config <<'EOF'
 
 # JDCloud RE-SS-01 clean profile: no optional LuCI applications

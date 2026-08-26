@@ -108,9 +108,9 @@ emmc_do_upgrade() {
 EOF
 chmod 0755 files/lib/upgrade/emmc.sh
 
-# Replace the complete JDCloud eMMC dispatch block, rather than replacing
-# a single occurrence. This avoids leaving duplicate/stale handlers when
-# the LiBwrt target source changes.
+# Replace the complete JDCloud eMMC dispatch block.  Do this against the
+# freshly imported target source and then normalize the handler explicitly;
+# this is intentionally robust against harmless changes in neighboring cases.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
@@ -119,14 +119,34 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
 
-new_case = '''\tjdcloud,re-ss-01|\\
-\tjdcloud,re-cs-02|\\
-\tjdcloud,re-cs-07|\\
-\tlink,nn6000-v1|\\
-\tlink,nn6000-v2)
-\t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
-\t\tpart_num="$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$cfgpart" | cut -f 1 -d "|" | head -n1)"
-\t\tif [ "$part_num" -eq "1" ]; then
+# Find the JDCloud case and its terminating ;;.  Keep all neighboring board
+# cases untouched.  The actual OpenWrt/LiBwrt source has a shared case block.
+start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', text)
+if not start:
+    raise SystemExit('ERROR: JDCloud case not found')
+end = re.search(r'(?m)^\s*;;\s*$', text[start.end():])
+if not end:
+    raise SystemExit('ERROR: JDCloud case terminator not found')
+end_pos = start.end() + end.end()
+block = text[start.start():end_pos]
+
+# The only valid upgrade call in this case is emmc_do_upgrade.
+block = re.sub(r'(?m)^\s*mmc_do_upgrade\s+"\$1"\s*$', '\t\temmc_do_upgrade "$1"', block)
+
+# Force the exact slot mapping used by the RE-SS-01 partition table.
+block = re.sub(r'(?m)^\s*kernelname=.*$', '', block)
+block = re.sub(r'(?m)^\s*rootfsname=.*$', '', block)
+if 'CI_KERNPART="0:HLOS_1"' not in block:
+    block = block.replace('\t\tlocal cfgpart=', '\t\tCI_KERNPART="0:HLOS_1"\n\t\tCI_ROOTPART="rootfs_1"\n\t\tlocal cfgpart=', 1) if '\t\tlocal cfgpart=' in block else block
+
+# If the source block does not already contain our explicit slot selection,
+# replace its body with the known-good dispatch body while retaining the case labels.
+if 'emmc_do_upgrade "$1"' not in block or 'CI_KERNPART="0:HLOS"' not in block:
+    labels = block.split(')', 1)[0] + ')'
+    block = labels + '''
+\t\tlocal cfgpart="/dev/mmcblk0p2"
+\t\tlocal slot="$(dd if="$cfgpart" bs=1 skip=148 count=1 2>/dev/null | hexdump -v -e '1/1 "%u"')"
+\t\tif [ "$slot" -eq 1 ]; then
 \t\t\tCI_KERNPART="0:HLOS_1"
 \t\t\tCI_ROOTPART="rootfs_1"
 \t\telse
@@ -136,28 +156,19 @@ new_case = '''\tjdcloud,re-ss-01|\\
 \t\temmc_do_upgrade "$1"
 \t\t;;'''
 
-# Match from the first JDCloud entry through the end of the adjacent
-# eMMC case, stopping immediately before the next device case.
-pattern = re.compile(
-    r'(?ms)^\tjdcloud,re-ss-01\|\\\n.*?^\t\t;;\n(?=\t(?:netgear|tplink|yuncore|linksys),)'
-)
-match = pattern.search(text)
-if not match:
-    raise SystemExit('ERROR: cannot find JDCloud eMMC dispatch block')
-text = text[:match.start()] + new_case + '\n' + text[match.end():]
+text = text[:start.start()] + block + text[end_pos:]
 path.write_text(text)
 PY
 
-# Validate only the JDCloud block. The source target may legitimately
-# contain mmc_do_upgrade handlers for other boards; those must not fail
-# the RE-SS-01 check.
+# Validate only the JDCloud case. Other boards may legitimately use
+# mmc_do_upgrade and must not make this check fail.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
-m = re.search(r'(?ms)^\tjdcloud,re-ss-01\|\\\n.*?^\t\t;;\n(?=\t(?:netgear|tplink|yuncore|linksys),)', text)
+m = re.search(r'(?ms)^\s*jdcloud,re-ss-01\|\\\n.*?^\s*;;\s*$', text)
 if not m:
     raise SystemExit('ERROR: JDCloud eMMC block not found')
 block = m.group(0)
@@ -169,8 +180,7 @@ if 'CI_KERNPART="0:HLOS_1"' not in block or 'CI_ROOTPART="rootfs_1"' not in bloc
     raise SystemExit('ERROR: inactive-slot mapping missing')
 if 'CI_KERNPART="0:HLOS"' not in block or 'CI_ROOTPART="rootfs"' not in block:
     raise SystemExit('ERROR: active-slot mapping missing')
-echo = print
-echo('RE-SS-01 eMMC upgrade handler: OK')
+print('RE-SS-01 eMMC upgrade handler: OK')
 PY
 
 test -f files/lib/upgrade/emmc.sh

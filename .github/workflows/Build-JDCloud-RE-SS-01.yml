@@ -98,7 +98,7 @@ jobs:
           block = text[start.start():start.end() + end.end()]
           if 'emmc_do_upgrade "$1"' not in block:
               raise SystemExit('ERROR: JDCloud block is not using emmc_do_upgrade')
-          if 'mmc_do_upgrade "$1"' in block:
+          if re.search(r'(?m)^\s*mmc_do_upgrade "\$1"', block):
               raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
           if 'CI_KERNPART="0:HLOS_1"' not in block or 'CI_ROOTPART="rootfs_1"' not in block:
               raise SystemExit('ERROR: inactive-slot mapping missing')

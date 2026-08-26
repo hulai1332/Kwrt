@@ -23,76 +23,27 @@ rm -rf package/nss-packages/nss-userspace-oss
 sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" target/linux/qualcommax/Makefile
 
 # ==========================================================
-# JDCloud RE-SS-01 / 亚瑟：eMMC sysupgrade 修复
+# JDCloud RE-SS-01 / 亚瑟：使用 OpenWrt 原生 eMMC A/B 升级逻辑
 # ==========================================================
-# 实际分区：p16=0:HLOS, p17=0:HLOS_1, p18=rootfs,
-# p20=rootfs_1。BOOTCONFIG/p2 的 byte 148 为当前槽位：
-# 0 = HLOS/rootfs，1 = HLOS_1/rootfs_1。
-# sysupgrade 必须写入“非当前槽”，完成后再切换 BOOTCONFIG。
+# RE-SS-01 的正确分区：
+#   p2  = 0:BOOTCONFIG
+#   p16 = 0:HLOS
+#   p17 = 0:HLOS_1
+#   p18 = rootfs
+#   p20 = rootfs_1
+# OpenWrt 原生 emmc_do_upgrade() 已支持该 sysupgrade tar。
+# BOOTCONFIG 偏移 148 用于选择要写入的槽位。
+# 不再使用不存在的 mmc_do_upgrade，也不覆盖原生 emmc.sh。
 # ==========================================================
 
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
-mkdir -p files/lib/upgrade
 
-cat > files/lib/upgrade/emmc.sh <<'EOF'
-# Copyright (C) 2021 OpenWrt.org
+# Remove any previous custom overlay and use the OpenWrt base-files
+# implementation of emmc_do_upgrade().
+rm -f files/lib/upgrade/emmc.sh
 
-. /lib/functions.sh
-. /lib/upgrade/common.sh
-
-emmc_do_upgrade() {
-	local image="$1"
-	local board_dir
-	local kern_dev root_dev
-	local cfgpart="/dev/mmcblk0p2"
-	local slot
-
-	# RE-SS-01 is an eMMC dual-slot device.  The sysupgrade image is a tar
-	# archive containing kernel and root.  Select the inactive slot directly;
-	# this avoids relying on missing fw_env/NVMEM support on this device.
-	slot="$(dd if="$cfgpart" bs=1 skip=148 count=1 2>/dev/null | hexdump -v -e '1/1 "%u"')"
-	case "$slot" in
-		1)
-			kern_dev="/dev/mmcblk0p16"
-			root_dev="/dev/mmcblk0p18"
-			new_slot=0
-			;;
-		*)
-			kern_dev="/dev/mmcblk0p17"
-			root_dev="/dev/mmcblk0p20"
-			new_slot=1
-			;;
-	esac
-
-	board_dir="$(tar tf "$image" | sed -n 's#^\(sysupgrade-[^/]*/\)$#\1#p' | head -n 1)"
-	[ -n "$board_dir" ] || return 1
-
-	# Kernel and rootfs are separate files in the sysupgrade tar.
-	tar xOf "$image" "${board_dir}kernel" > /tmp/re-ss-01-kernel || return 1
-	tar xOf "$image" "${board_dir}root" > /tmp/re-ss-01-root || return 1
-
-	# The HLOS partitions are 6 MiB.  Rootfs partitions are 2 GiB and
-	# 60 MiB respectively; the image root is written at the beginning.
-	dd if=/tmp/re-ss-01-kernel of="$kern_dev" bs=4M conv=fsync || return 1
-	dd if=/tmp/re-ss-01-root of="$root_dev" bs=4M conv=fsync || return 1
-	sync
-
-	# Switch the boot slot only after both images were written successfully.
-	printf '\001' | dd of="$cfgpart" bs=1 seek=148 conv=notrunc 2>/dev/null
-	if [ "$new_slot" = 0 ]; then
-		printf '\000' | dd of="$cfgpart" bs=1 seek=148 conv=notrunc 2>/dev/null
-	else
-		printf '\001' | dd of="$cfgpart" bs=1 seek=148 conv=notrunc 2>/dev/null
-	fi
-	sync
-	rm -f /tmp/re-ss-01-kernel /tmp/re-ss-01-root
-}
-EOF
-chmod 0755 files/lib/upgrade/emmc.sh
-
-# Replace the entire JDCloud case with one deterministic block.  Do not use
-# a text substitution of only the upgrade call: the previous version left
-# the old mmc_do_upgrade handler in the generated source.
+# LiBwrt's platform.sh is older than the OpenWrt 25.12 implementation.
+# Replace the complete JDCloud block with the upstream eMMC handler.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
@@ -104,19 +55,25 @@ text = path.read_text()
 start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', text)
 if not start:
     raise SystemExit('ERROR: JDCloud case not found')
+
 end = re.search(r'(?m)^\s*;;\s*$', text[start.end():])
 if not end:
     raise SystemExit('ERROR: JDCloud case terminator not found')
 
-labels = '''\tjdcloud,re-ss-01|\\
-\tjdcloud,re-cs-02|\\
+replacement = '''\tjdcloud,re-cs-02|\\
 \tjdcloud,re-cs-07|\\
+\tjdcloud,re-ss-01|\\
 \tlink,nn6000-v1|\\
-\tlink,nn6000-v2|\\
-\tphilips,ly1800|\\
-\tredmi,ax5-jdcloud)'''
-
-replacement = labels + '''
+\tlink,nn6000-v2)
+\t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
+\t\tpart_num="$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$cfgpart" | cut -f 1 -d "|" | head -n1)"
+\t\tif [ "$part_num" -eq "1" ]; then
+\t\t\tCI_KERNPART="0:HLOS_1"
+\t\t\tCI_ROOTPART="rootfs_1"
+\t\telse
+\t\t\tCI_KERNPART="0:HLOS"
+\t\t\tCI_ROOTPART="rootfs"
+\t\tfi
 \t\temmc_do_upgrade "$1"
 \t\t;;'''
 
@@ -124,27 +81,31 @@ text = text[:start.start()] + replacement + text[start.end() + end.end():]
 path.write_text(text)
 PY
 
-# Verify the generated target source before compilation.
+# Verify the exact handler before compilation.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 text = Path(sys.argv[1]).read_text()
-m = re.search(r'(?ms)^\s*jdcloud,re-ss-01\|\\\n.*?^\s*;;\s*$', text)
+m = re.search(r'(?ms)^\s*jdcloud,re-cs-02\|\\\n.*?^\s*;;\s*$', text)
 if not m:
     raise SystemExit('ERROR: JDCloud eMMC block not found')
 block = m.group(0)
-if 'emmc_do_upgrade "$1"' not in block:
-    raise SystemExit('ERROR: JDCloud block is not using emmc_do_upgrade')
+for needle in (
+    'local cfgpart=$(find_mmc_part "0:BOOTCONFIG")',
+    'CI_KERNPART="0:HLOS_1"',
+    'CI_ROOTPART="rootfs_1"',
+    'CI_KERNPART="0:HLOS"',
+    'CI_ROOTPART="rootfs"',
+    'emmc_do_upgrade "$1"',
+):
+    if needle not in block:
+        raise SystemExit(f'ERROR: missing {needle}')
 if 'mmc_do_upgrade "$1"' in block:
     raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
 print('RE-SS-01 eMMC upgrade handler: OK')
 PY
-
-test -f files/lib/upgrade/emmc.sh
-grep -q 'emmc_do_upgrade' files/lib/upgrade/emmc.sh
-echo 'emmc.sh: OK'
 
 # Clean profile: no optional LuCI apps or proxy cores.
 if [ -f include/target.mk ]; then

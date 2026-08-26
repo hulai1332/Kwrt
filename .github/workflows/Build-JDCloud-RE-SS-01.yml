@@ -7,6 +7,7 @@ on:
       - 25.12
     paths:
       - '.github/workflows/Build-JDCloud-RE-SS-01.yml'
+      - 'devices/qualcommax_ipq60xx/diy.sh'
 
 permissions:
   contents: read
@@ -82,19 +83,19 @@ jobs:
           grep -q 'emmc_do_upgrade' files/lib/upgrade/emmc.sh
           grep -q 'jdcloud,re-ss-01' "$PLATFORM"
 
-          # Only the JDCloud eMMC case must use emmc_do_upgrade.
-          # Other boards in the shared platform.sh may legitimately use
-          # the legacy mmc_do_upgrade handler and must not fail this check.
           python3 - "$PLATFORM" <<'PY'
           import re
           import sys
           from pathlib import Path
 
           text = Path(sys.argv[1]).read_text()
-          m = re.search(r'(?ms)^\tjdcloud,re-ss-01\|\\\n.*?^\t\t;;\n(?=\t(?:netgear|tplink|yuncore|linksys),)', text)
-          if not m:
+          start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', text)
+          if not start:
               raise SystemExit('ERROR: JDCloud eMMC block not found')
-          block = m.group(0)
+          end = re.search(r'(?m)^\s*;;\s*$', text[start.end():])
+          if not end:
+              raise SystemExit('ERROR: JDCloud eMMC block terminator not found')
+          block = text[start.start():start.end() + end.end()]
           if 'emmc_do_upgrade "$1"' not in block:
               raise SystemExit('ERROR: JDCloud block is not using emmc_do_upgrade')
           if 'mmc_do_upgrade "$1"' in block:

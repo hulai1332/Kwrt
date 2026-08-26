@@ -33,11 +33,10 @@ sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" ta
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
 
 # The OpenWrt 25.12 base-files eMMC helper is not copied by the
-# LiBwrt NSS target tree, so install the upstream helper into files/.
+# LiBwrt NSS target tree, so install the helper into files/.
 mkdir -p files/lib/upgrade
 cat > files/lib/upgrade/emmc.sh <<'EOF'
 # Copyright (C) 2021 OpenWrt.org
-#
 
 . /lib/functions.sh
 
@@ -95,28 +94,26 @@ emmc_copy_config() {
 emmc_do_upgrade() {
 	local file_type=$(identify_magic_long "$(get_magic_long "$1")")
 	case "$file_type" in
-		"fit") emmc_upgrade_fit $1;;
-		*) emmc_upgrade_tar $1;;
+		"fit") emmc_upgrade_fit "$1";;
+		*) emmc_upgrade_tar "$1";;
 	esac
 }
 EOF
 
-# Replace only the RE-SS-01 case. Keep the other Qualcomm eMMC boards on
-# their existing handlers.
+# Replace the complete RE-SS-01 case after the NSS source tree has been copied.
+# Use a multiline match that is independent of the exact continuation formatting
+# used by the upstream platform.sh.
 python3 - "$PLATFORM_SH" <<'PY'
-import re, sys
+import re
+import sys
 from pathlib import Path
+
 p = Path(sys.argv[1])
 s = p.read_text()
-start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', s)
-if not start:
-    raise SystemExit('ERROR: JDCloud RE-SS-01 case not found')
-end = re.search(r'(?m)^\s*;;\s*$', s[start.end():])
-if not end:
-    raise SystemExit('ERROR: JDCloud RE-SS-01 case terminator not found')
+pattern = re.compile(r'(?ms)^\s*jdcloud,re-ss-01\|\\.*?^\s*;;\s*$')
 replacement = '''\tjdcloud,re-ss-01)
 \t\tlocal cfgpart="$(find_mmc_part \"0:BOOTCONFIG\")"
-\t\tlocal part_num="$(hexdump -e '1/1 \"%01x|\"' -n 1 -s 148 -C \"$cfgpart\" | cut -f 1 -d \"|\" | head -n1)"
+\t\tlocal part_num="$(dd if=\"$cfgpart\" bs=1 skip=148 count=1 2>/dev/null | hexdump -v -e '1/1 %u')"
 \t\tif [ \"$part_num\" -eq 1 ]; then
 \t\t\tCI_KERNPART="0:HLOS_1"
 \t\t\tCI_ROOTPART="rootfs_1"
@@ -124,13 +121,16 @@ replacement = '''\tjdcloud,re-ss-01)
 \t\t\tCI_KERNPART="0:HLOS"
 \t\t\tCI_ROOTPART="rootfs"
 \t\tfi
-\t\temmc_do_upgrade "$1"
+\t\temmc_do_upgrade \"$1\"
 \t\t;;'''
-s = s[:start.start()] + replacement + s[start.end()+end.end():]
+
+if not pattern.search(s):
+    raise SystemExit('ERROR: JDCloud RE-SS-01 case not found in upstream platform.sh')
+s = pattern.sub(replacement, s, count=1)
 p.write_text(s)
 PY
 
-# Do not carry optional proxy/UI packages into the clean image.
+# Keep the clean image free of optional proxy/UI packages.
 cat >> .config <<'EOF'
 
 CONFIG_PACKAGE_luci-app-advancedplus=n

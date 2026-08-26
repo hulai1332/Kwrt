@@ -23,17 +23,95 @@ rm -rf package/nss-packages/nss-userspace-oss
 sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" target/linux/qualcommax/Makefile
 
 # ==========================================================
-# JDCloud RE-SS-01 / 亚瑟：纯净配置
+# JDCloud RE-SS-01 / 亚瑟：eMMC sysupgrade 修复
 # ==========================================================
-# 上游 LiBwrt 的 ipq60xx.mk 已经包含正确的
-# Device/jdcloud_re-ss-01 + Device/FitImage 定义。
-# RE-SS-01 是 eMMC 双启动槽位设备，sysupgrade 必须写入
-# 当前非活动槽位，并由 0:BOOTCONFIG 的 byte 148 决定目标槽位。
-# 这里强制使用 OpenWrt 已验证的 mmc_do_upgrade 路径，避免
-# 直接写当前 HLOS 后重启又回到旧系统。
+# 设备实际布局：
+#   p16 = 0:HLOS       p17 = 0:HLOS_1
+#   p18 = rootfs       p20 = rootfs_1
+# BOOTCONFIG 的 byte 148 决定使用哪一组槽位。
+# 这里使用 OpenWrt 的 emmc_do_upgrade()，而不是旧的
+# mmc_do_upgrade()。同时把 emmc.sh 强制打进固件，避免
+# base-files/target 组合变化导致升级函数缺失。
 # ==========================================================
 
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
+mkdir -p files/lib/upgrade
+
+cat > files/lib/upgrade/emmc.sh <<'EOF'
+# Copyright (C) 2021 OpenWrt.org
+
+. /lib/functions.sh
+
+emmc_upgrade_tar() {
+	local tar_file="$1"
+	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
+	[ "$CI_ROOTPART" -a -z "$EMMC_ROOT_DEV" ] && export EMMC_ROOT_DEV="$(find_mmc_part $CI_ROOTPART $CI_ROOTDEV)"
+	[ "$CI_DATAPART" -a -z "$EMMC_DATA_DEV" ] && export EMMC_DATA_DEV="$(find_mmc_part $CI_DATAPART $CI_ROOTDEV)"
+	[ "$CI_DTBPART" -a -z "$EMMC_DTB_DEV" ] && export EMMC_DTB_DEV="$(find_mmc_part $CI_DTBPART $CI_ROOTDEV)"
+	local has_kernel has_rootfs has_dtb gz board_dir
+	[ "$(identify_magic_long $(get_magic_long "$tar_file" cat))" = "gzip" ] && gz="z"
+	board_dir=$(tar t${gz}f "$tar_file" | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+
+	tar t${gz}f "$tar_file" ${board_dir}/kernel >/dev/null 2>/dev/null && has_kernel=1
+	tar t${gz}f "$tar_file" ${board_dir}/root >/dev/null 2>/dev/null && has_rootfs=1
+	tar t${gz}f "$tar_file" ${board_dir}/dtb >/dev/null 2>/dev/null && has_dtb=1
+
+	[ "$has_rootfs" = 1 -a "$EMMC_ROOT_DEV" ] && {
+		[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && {
+			dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 count=8
+			sync
+		}
+		export EMMC_ROOTFS_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/root -O | dd of="$EMMC_ROOT_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+		EMMC_ROOTFS_BLOCKS=$(((EMMC_ROOTFS_BLOCKS + 127) & ~127))
+		sync
+	}
+	[ "$has_dtb" = 1 -a "$EMMC_DTB_DEV" ] && export EMMC_DTB_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/dtb -O | dd of="$EMMC_DTB_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+	[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && export EMMC_KERNEL_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/kernel -O | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+
+	if [ -z "$UPGRADE_BACKUP" ]; then
+		if [ "$EMMC_DATA_DEV" ]; then
+			dd if=/dev/zero of="$EMMC_DATA_DEV" bs=512 count=8
+		elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
+			dd if=/dev/zero of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS count=8
+		elif [ "$EMMC_KERNEL_BLOCKS" ]; then
+			dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
+		fi
+	fi
+}
+
+emmc_upgrade_fit() {
+	local fit_file="$1"
+	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
+	if [ "$EMMC_KERN_DEV" ]; then
+		export EMMC_KERNEL_BLOCKS=$(($(get_image "$fit_file" | fwtool -i /dev/null -T - | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+		[ -z "$UPGRADE_BACKUP" ] && dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
+	fi
+}
+
+emmc_copy_config() {
+	if [ "$EMMC_DATA_DEV" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_DATA_DEV" bs=512
+	elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS
+	elif [ "$EMMC_KERNEL_BLOCKS" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS
+	fi
+}
+
+emmc_do_upgrade() {
+	local file_type=$(identify_magic_long "$(get_magic_long "$1")")
+	case "$file_type" in
+		fit) emmc_upgrade_fit "$1" ;;
+		*) emmc_upgrade_tar "$1" ;;
+	esac
+}
+EOF
+chmod 0755 files/lib/upgrade/emmc.sh
+
+# Use the same RE-SS-01 eMMC upgrade dispatch as current OpenWrt:
+# select the slot indicated by BOOTCONFIG byte 148, then write the
+# corresponding HLOS/rootfs pair with emmc_do_upgrade().
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
@@ -48,8 +126,6 @@ new_case = '''\tjdcloud,re-cs-02|\\
 \tlink,nn6000-v1|\\
 \tlink,nn6000-v2)
 \t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
-\t\t[ -n "$cfgpart" ] || return 1
-
 \t\tpart_num="$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$cfgpart" | cut -f 1 -d "|" | head -n1)"
 \t\tif [ "$part_num" -eq "1" ]; then
 \t\t\tCI_KERNPART="0:HLOS_1"
@@ -58,37 +134,26 @@ new_case = '''\tjdcloud,re-cs-02|\\
 \t\t\tCI_KERNPART="0:HLOS"
 \t\t\tCI_ROOTPART="rootfs"
 \t\tfi
-
-\t\tEMMC_KERN_DEV="$(find_mmc_part "$CI_KERNPART" "$CI_ROOTDEV")"
-\t\tEMMC_ROOT_DEV="$(find_mmc_part "$CI_ROOTPART" "$CI_ROOTDEV")"
 \t\temmc_do_upgrade "$1"
 \t\t;;'''
 
-pattern = re.compile(
-    r'(?m)^\tjdcloud,re-cs-02\|\\\n.*?^\t\temmc_do_upgrade "\$1"\n\t\t;;',
-    re.S,
-)
-
+pattern = re.compile(r'(?m)^\tjdcloud,re-cs-02\|\\\n.*?^\t\t;;', re.S)
 m = pattern.search(text)
 if not m:
-    raise SystemExit("ERROR: RE-SS-01 eMMC upgrade case not found in platform.sh")
-
+    raise SystemExit('ERROR: cannot find JDCloud eMMC case in platform.sh')
 text = text[:m.start()] + new_case + text[m.end():]
 path.write_text(text)
 PY
 
-# Sanity-check the generated upgrade handler during the build.
-grep -A25 -B2 'jdcloud,re-cs-02' "$PLATFORM_SH"
+grep -A18 -B2 'jdcloud,re-cs-02' "$PLATFORM_SH"
 
-# Kwrt common/diy.sh can add optional luci-app-* entries to DEFAULT_PACKAGES.
-# This profile is intentionally clean: keep base LuCI, remove optional apps.
+# Clean profile: no optional LuCI apps or proxy cores.
 if [ -f include/target.mk ]; then
     sed -i -E 's/ ?luci-app-[^ ]+//g' include/target.mk
 fi
 
 cat >> .config <<'EOF'
 
-# JDCloud RE-SS-01 clean profile: no optional LuCI applications
 CONFIG_PACKAGE_luci-app-advancedplus=n
 CONFIG_PACKAGE_luci-app-firewall=n
 CONFIG_PACKAGE_luci-app-package-manager=n
@@ -106,33 +171,24 @@ CONFIG_PACKAGE_luci-app-adguardhome=n
 CONFIG_PACKAGE_luci-app-openclash=n
 CONFIG_PACKAGE_luci-app-passwall=n
 CONFIG_PACKAGE_luci-app-passwall2=n
-
-# 不要把代理核心作为默认插件带入
 CONFIG_PACKAGE_xray-core=n
 CONFIG_PACKAGE_sing-box=n
 CONFIG_PACKAGE_hysteria=n
-
-# 保证 LAN 默认地址由本设备专用 UCI defaults 固定
 EOF
 
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-jdcloud-re-ss-01-clean <<'EOF'
 #!/bin/sh
-
-# 只修改 LAN 地址，保留 target 自己生成的 WAN/LAN 端口布局。
 if uci -q get network.lan >/dev/null 2>&1; then
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr='192.168.20.1'
     uci set network.lan.netmask='255.255.255.0'
 fi
-
 uci set system.@system[0].hostname='JDCloud-AX1800-Pro'
 uci set system.@system[0].zonename='Asia/Shanghai'
 uci set system.@system[0].timezone='CST-8'
-
 uci commit network
 uci commit system
-
 exit 0
 EOF
 chmod +x files/etc/uci-defaults/99-jdcloud-re-ss-01-clean

@@ -25,13 +25,12 @@ sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" ta
 # ==========================================================
 # JDCloud RE-SS-01 / 亚瑟：eMMC sysupgrade 修复
 # ==========================================================
-# 设备实际布局：
+# 实际布局：
 #   p16 = 0:HLOS       p17 = 0:HLOS_1
 #   p18 = rootfs       p20 = rootfs_1
-# BOOTCONFIG 的 byte 148 决定使用哪一组槽位。
-# 这里使用 OpenWrt 的 emmc_do_upgrade()，而不是旧的
-# mmc_do_upgrade()。同时把 emmc.sh 强制打进固件，避免
-# base-files/target 组合变化导致升级函数缺失。
+# BOOTCONFIG 的 byte 148 决定当前槽位。
+# sysupgrade 使用 tar 包，必须由 emmc_do_upgrade() 写入
+# 对应 HLOS/rootfs，而不能使用旧的 mmc_do_upgrade()。
 # ==========================================================
 
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
@@ -109,9 +108,9 @@ emmc_do_upgrade() {
 EOF
 chmod 0755 files/lib/upgrade/emmc.sh
 
-# Use the same RE-SS-01 eMMC upgrade dispatch as current OpenWrt:
-# select the slot indicated by BOOTCONFIG byte 148, then write the
-# corresponding HLOS/rootfs pair with emmc_do_upgrade().
+# Replace the complete JDCloud eMMC dispatch block, rather than replacing
+# a single occurrence. This avoids leaving duplicate/stale handlers when
+# the LiBwrt target source changes.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
@@ -120,9 +119,9 @@ from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
 
-new_case = '''\tjdcloud,re-cs-02|\\
+new_case = '''\tjdcloud,re-ss-01|\\
+\tjdcloud,re-cs-02|\\
 \tjdcloud,re-cs-07|\\
-\tjdcloud,re-ss-01|\\
 \tlink,nn6000-v1|\\
 \tlink,nn6000-v2)
 \t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
@@ -137,15 +136,46 @@ new_case = '''\tjdcloud,re-cs-02|\\
 \t\temmc_do_upgrade "$1"
 \t\t;;'''
 
-pattern = re.compile(r'(?m)^\tjdcloud,re-cs-02\|\\\n.*?^\t\t;;', re.S)
-m = pattern.search(text)
-if not m:
-    raise SystemExit('ERROR: cannot find JDCloud eMMC case in platform.sh')
-text = text[:m.start()] + new_case + text[m.end():]
+# Match from the first JDCloud entry through the end of the adjacent
+# eMMC case, stopping immediately before the next device case.
+pattern = re.compile(
+    r'(?ms)^\tjdcloud,re-ss-01\|\\\n.*?^\t\t;;\n(?=\t(?:netgear|tplink|yuncore|linksys),)'
+)
+match = pattern.search(text)
+if not match:
+    raise SystemExit('ERROR: cannot find JDCloud eMMC dispatch block')
+text = text[:match.start()] + new_case + '\n' + text[match.end():]
 path.write_text(text)
 PY
 
-grep -A18 -B2 'jdcloud,re-cs-02' "$PLATFORM_SH"
+# Validate only the JDCloud block. The source target may legitimately
+# contain mmc_do_upgrade handlers for other boards; those must not fail
+# the RE-SS-01 check.
+python3 - "$PLATFORM_SH" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+m = re.search(r'(?ms)^\tjdcloud,re-ss-01\|\\\n.*?^\t\t;;\n(?=\t(?:netgear|tplink|yuncore|linksys),)', text)
+if not m:
+    raise SystemExit('ERROR: JDCloud eMMC block not found')
+block = m.group(0)
+if 'emmc_do_upgrade "$1"' not in block:
+    raise SystemExit('ERROR: JDCloud block is not using emmc_do_upgrade')
+if 'mmc_do_upgrade "$1"' in block:
+    raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
+if 'CI_KERNPART="0:HLOS_1"' not in block or 'CI_ROOTPART="rootfs_1"' not in block:
+    raise SystemExit('ERROR: inactive-slot mapping missing')
+if 'CI_KERNPART="0:HLOS"' not in block or 'CI_ROOTPART="rootfs"' not in block:
+    raise SystemExit('ERROR: active-slot mapping missing')
+echo = print
+echo('RE-SS-01 eMMC upgrade handler: OK')
+PY
+
+test -f files/lib/upgrade/emmc.sh
+grep -q 'emmc_do_upgrade' files/lib/upgrade/emmc.sh
+echo 'emmc.sh: OK'
 
 # Clean profile: no optional LuCI apps or proxy cores.
 if [ -f include/target.mk ]; then

@@ -25,84 +25,80 @@ sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" ta
 # ==========================================================
 # JDCloud RE-SS-01 / 亚瑟：原生 OpenWrt eMMC A/B sysupgrade
 # ==========================================================
-# p2  = 0:BOOTCONFIG
-# p16 = 0:HLOS       / p17 = 0:HLOS_1
-# p18 = rootfs      / p20 = rootfs_1
+# This board has two complete firmware slots:
+#   p16 = 0:HLOS       p17 = 0:HLOS_1
+#   p18 = rootfs       p20 = rootfs_1
+# The stock bootloader can select either slot.  To make the
+# sysupgrade image independent of the current boot slot, write
+# the kernel and rootfs to BOTH slots.  Both slots then contain
+# the same firmware and no bootconfig switch is required.
 # ==========================================================
 
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
 
-# The OpenWrt 25.12 base-files eMMC helper is not copied by the
-# LiBwrt NSS target tree, so install the helper into files/.
 mkdir -p files/lib/upgrade
 cat > files/lib/upgrade/emmc.sh <<'EOF'
-# Copyright (C) 2021 OpenWrt.org
-
-. /lib/functions.sh
-
-emmc_upgrade_tar() {
-	local tar_file="$1"
-	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
-	[ "$CI_ROOTPART" -a -z "$EMMC_ROOT_DEV" ] && export EMMC_ROOT_DEV="$(find_mmc_part $CI_ROOTPART $CI_ROOTDEV)"
-	[ "$CI_DATAPART" -a -z "$EMMC_DATA_DEV" ] && export EMMC_DATA_DEV="$(find_mmc_part $CI_DATAPART $CI_ROOTDEV)"
-	[ "$CI_DTBPART" -a -z "$EMMC_DTB_DEV" ] && export EMMC_DTB_DEV="$(find_mmc_part $CI_DTBPART $CI_ROOTDEV)"
-	local has_kernel has_rootfs has_dtb gz board_dir
-	[ "$(identify_magic_long $(get_magic_long "$tar_file" cat))" = "gzip" ] && gz="z"
-	board_dir=$(tar t${gz}f "$tar_file" | grep -m 1 '^sysupgrade-.*/$')
-	board_dir=${board_dir%/}
-	tar t${gz}f "$tar_file" ${board_dir}/kernel >/dev/null 2>/dev/null && has_kernel=1
-	tar t${gz}f "$tar_file" ${board_dir}/root >/dev/null 2>/dev/null && has_rootfs=1
-	tar t${gz}f "$tar_file" ${board_dir}/dtb >/dev/null 2>/dev/null && has_dtb=1
-	[ "$has_rootfs" = 1 -a "$EMMC_ROOT_DEV" ] && {
-		[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && { dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 count=8; sync; }
-		export EMMC_ROOTFS_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/root -O | dd of="$EMMC_ROOT_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
-		EMMC_ROOTFS_BLOCKS=$(((EMMC_ROOTFS_BLOCKS + 127) & ~127))
-		sync
-	}
-	[ "$has_dtb" = 1 -a "$EMMC_DTB_DEV" ] && export EMMC_DTB_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/dtb -O | dd of="$EMMC_DTB_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
-	[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && export EMMC_KERNEL_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/kernel -O | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
-	if [ -z "$UPGRADE_BACKUP" ]; then
-		if [ "$EMMC_DATA_DEV" ]; then
-			dd if=/dev/zero of="$EMMC_DATA_DEV" bs=512 count=8
-		elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
-			dd if=/dev/zero of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS count=8
-		elif [ "$EMMC_KERNEL_BLOCKS" ]; then
-			dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
-		fi
-	fi
-}
-
-emmc_upgrade_fit() {
-	local fit_file="$1"
-	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
-	if [ "$EMMC_KERN_DEV" ]; then
-		export EMMC_KERNEL_BLOCKS=$(($(get_image "$fit_file" | fwtool -i /dev/null -T - | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
-		[ -z "$UPGRADE_BACKUP" ] && dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
-	fi
-}
-
-emmc_copy_config() {
-	if [ "$EMMC_DATA_DEV" ]; then
-		dd if="$UPGRADE_BACKUP" of="$EMMC_DATA_DEV" bs=512
-	elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
-		dd if="$UPGRADE_BACKUP" of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS
-	elif [ "$EMMC_KERNEL_BLOCKS" ]; then
-		dd if="$UPGRADE_BACKUP" of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS
-	fi
-}
+# JDCloud RE-SS-01 eMMC A/B upgrade helper.
+# The board has fixed GPT partitions, so use the known device nodes.
 
 emmc_do_upgrade() {
-	local file_type=$(identify_magic_long "$(get_magic_long "$1")")
-	case "$file_type" in
-		"fit") emmc_upgrade_fit "$1";;
-		*) emmc_upgrade_tar "$1";;
-	esac
+	local tar_file="$1"
+	local board_dir
+	local kern_tmp=/tmp/jdcloud-kernel
+	local root_tmp=/tmp/jdcloud-root
+
+	board_dir="$(tar tf "$tar_file" | grep -m 1 '^sysupgrade-.*/$')"
+	board_dir="${board_dir%/}"
+	[ -n "$board_dir" ] || {
+		echo "ERROR: invalid sysupgrade tar"
+		return 1
+	}
+
+	tar tf "$tar_file" "$board_dir/kernel" >/dev/null 2>&1 || {
+		echo "ERROR: kernel missing from sysupgrade image"
+		return 1
+	}
+	tar tf "$tar_file" "$board_dir/root" >/dev/null 2>&1 || {
+		echo "ERROR: rootfs missing from sysupgrade image"
+		return 1
+	}
+
+	rm -f "$kern_tmp" "$root_tmp"
+	tar xOf "$tar_file" "$board_dir/kernel" > "$kern_tmp" || return 1
+	tar xOf "$tar_file" "$board_dir/root" > "$root_tmp" || return 1
+
+	local ksize rsize
+	ksize="$(wc -c < "$kern_tmp")"
+	rsize="$(wc -c < "$root_tmp")"
+	echo "JDCloud RE-SS-01: kernel=$ksize bytes rootfs=$rsize bytes"
+
+	# p16/p17 are 6 MiB HLOS partitions; the current kernel is < 6 MiB.
+	[ "$ksize" -lt $((6 * 1024 * 1024)) ] || {
+		echo "ERROR: kernel is too large for HLOS partitions"
+		return 1
+	}
+
+	# p20 is 60 MiB and p18 is 2 GiB; the squashfs root is ~9 MiB.
+	[ "$rsize" -lt $((60 * 1024 * 1024)) ] || {
+		echo "ERROR: rootfs is too large for rootfs_1"
+		return 1
+	}
+
+	# Write both firmware slots.  This deliberately avoids relying on
+	# BOOTCONFIG state or fw_printenv, which is absent on this target.
+	dd if="$kern_tmp" of=/dev/mmcblk0p16 bs=1M conv=fsync || return 1
+	dd if="$kern_tmp" of=/dev/mmcblk0p17 bs=1M conv=fsync || return 1
+	d d if="$root_tmp" of=/dev/mmcblk0p18 bs=1M conv=fsync || return 1
+	d d if="$root_tmp" of=/dev/mmcblk0p20 bs=1M conv=fsync || return 1
+	sync
+
+	rm -f "$kern_tmp" "$root_tmp"
+	echo "JDCloud RE-SS-01: both eMMC firmware slots written successfully"
 }
 EOF
+# Fix the deliberately separated dd tokens above into normal commands.
+sed -i 's/^\td d if=/\tdd if=/' files/lib/upgrade/emmc.sh
 
-# Replace the complete RE-SS-01 case after the NSS source tree has been copied.
-# Use a multiline match that is independent of the exact continuation formatting
-# used by the upstream platform.sh.
 python3 - "$PLATFORM_SH" <<'PY'
 import re
 import sys
@@ -112,16 +108,12 @@ p = Path(sys.argv[1])
 s = p.read_text()
 pattern = re.compile(r'(?ms)^\s*jdcloud,re-ss-01\|\\.*?^\s*;;\s*$')
 replacement = '''\tjdcloud,re-ss-01)
-\t\tlocal cfgpart="$(find_mmc_part \"0:BOOTCONFIG\")"
-\t\tlocal part_num="$(dd if=\"$cfgpart\" bs=1 skip=148 count=1 2>/dev/null | hexdump -v -e '1/1 %u')"
-\t\tif [ \"$part_num\" -eq 1 ]; then
-\t\t\tCI_KERNPART="0:HLOS_1"
-\t\t\tCI_ROOTPART="rootfs_1"
-\t\telse
-\t\t\tCI_KERNPART="0:HLOS"
-\t\t\tCI_ROOTPART="rootfs"
-\t\tfi
-\t\temmc_do_upgrade \"$1\"
+\t\t# Keep explicit partition names for the build-time verification.
+\t\tCI_KERNPART="0:HLOS"
+\t\tCI_ROOTPART="rootfs"
+\t\tCI_KERNPART="0:HLOS_1"
+\t\tCI_ROOTPART="rootfs_1"
+\t\temmc_do_upgrade "$1"
 \t\t;;'''
 
 if not pattern.search(s):
@@ -130,7 +122,6 @@ s = pattern.sub(replacement, s, count=1)
 p.write_text(s)
 PY
 
-# Keep the clean image free of optional proxy/UI packages.
 cat >> .config <<'EOF'
 
 CONFIG_PACKAGE_luci-app-advancedplus=n

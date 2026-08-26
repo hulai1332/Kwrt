@@ -68,6 +68,21 @@ jobs:
           chmod +x ../devices/qualcommax_ipq60xx/diy.sh
           /bin/bash ../devices/qualcommax_ipq60xx/diy.sh
 
+      - name: Verify RE-SS-01 eMMC upgrade implementation
+        working-directory: openwrt
+        run: |
+          set -eux
+          test -f files/lib/upgrade/emmc.sh
+          grep -q 'emmc_do_upgrade' files/lib/upgrade/emmc.sh
+          grep -q 'jdcloud,re-ss-01' target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh
+          grep -q 'emmc_do_upgrade "$1"' target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh
+          if grep -q 'mmc_do_upgrade "$1"' target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh; then
+            echo 'ERROR: stale mmc_do_upgrade handler remains'
+            exit 1
+          fi
+          echo 'RE-SS-01 eMMC upgrade handler: OK'
+          echo 'emmc.sh: OK'
+
       - name: Configure clean JDCloud RE-SS-01
         working-directory: openwrt
         run: |
@@ -137,6 +152,16 @@ jobs:
       - name: Compile firmware
         working-directory: openwrt
         run: make -j$(nproc) V=s
+
+      - name: Verify generated sysupgrade image
+        working-directory: openwrt
+        run: |
+          set -eux
+          IMG="$(find bin/targets/qualcommax/ipq60xx -maxdepth 1 -type f -name '*jdcloud_re-ss-01-squashfs-sysupgrade.bin' | head -n1)"
+          test -n "$IMG"
+          tar tf "$IMG" | grep -q '/kernel$'
+          tar tf "$IMG" | grep -q '/root$'
+          echo "Verified sysupgrade image: $IMG"
 
       - name: Show firmware files
         run: find openwrt/bin/targets/qualcommax/ipq60xx -maxdepth 2 -type f -printf '%p %s bytes\n' | sort

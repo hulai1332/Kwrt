@@ -23,51 +23,101 @@ rm -rf package/nss-packages/nss-userspace-oss
 sed -i "s/luci uboot-envtools wpad-openssl/luci uboot-envtools wpad-mbedtls/" target/linux/qualcommax/Makefile
 
 # ==========================================================
-# JDCloud RE-SS-01 / 亚瑟：使用 OpenWrt 原生 eMMC A/B 升级逻辑
+# JDCloud RE-SS-01 / 亚瑟：原生 OpenWrt eMMC A/B sysupgrade
 # ==========================================================
-# RE-SS-01 的正确分区：
-#   p2  = 0:BOOTCONFIG
-#   p16 = 0:HLOS
-#   p17 = 0:HLOS_1
-#   p18 = rootfs
-#   p20 = rootfs_1
-# OpenWrt 原生 emmc_do_upgrade() 已支持该 sysupgrade tar。
-# BOOTCONFIG 偏移 148 用于选择要写入的槽位。
-# 不再使用不存在的 mmc_do_upgrade，也不覆盖原生 emmc.sh。
+# p2  = 0:BOOTCONFIG
+# p16 = 0:HLOS       / p17 = 0:HLOS_1
+# p18 = rootfs      / p20 = rootfs_1
 # ==========================================================
 
 PLATFORM_SH="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
 
-# Remove any previous custom overlay and use the OpenWrt base-files
-# implementation of emmc_do_upgrade().
-rm -f files/lib/upgrade/emmc.sh
+# The OpenWrt 25.12 base-files eMMC helper is not copied by the
+# LiBwrt NSS target tree, so install the upstream helper into files/.
+mkdir -p files/lib/upgrade
+cat > files/lib/upgrade/emmc.sh <<'EOF'
+# Copyright (C) 2021 OpenWrt.org
+#
 
-# LiBwrt's platform.sh is older than the OpenWrt 25.12 implementation.
-# Replace the complete JDCloud block with the upstream eMMC handler.
+. /lib/functions.sh
+
+emmc_upgrade_tar() {
+	local tar_file="$1"
+	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
+	[ "$CI_ROOTPART" -a -z "$EMMC_ROOT_DEV" ] && export EMMC_ROOT_DEV="$(find_mmc_part $CI_ROOTPART $CI_ROOTDEV)"
+	[ "$CI_DATAPART" -a -z "$EMMC_DATA_DEV" ] && export EMMC_DATA_DEV="$(find_mmc_part $CI_DATAPART $CI_ROOTDEV)"
+	[ "$CI_DTBPART" -a -z "$EMMC_DTB_DEV" ] && export EMMC_DTB_DEV="$(find_mmc_part $CI_DTBPART $CI_ROOTDEV)"
+	local has_kernel has_rootfs has_dtb gz board_dir
+	[ "$(identify_magic_long $(get_magic_long "$tar_file" cat))" = "gzip" ] && gz="z"
+	board_dir=$(tar t${gz}f "$tar_file" | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+	tar t${gz}f "$tar_file" ${board_dir}/kernel >/dev/null 2>/dev/null && has_kernel=1
+	tar t${gz}f "$tar_file" ${board_dir}/root >/dev/null 2>/dev/null && has_rootfs=1
+	tar t${gz}f "$tar_file" ${board_dir}/dtb >/dev/null 2>/dev/null && has_dtb=1
+	[ "$has_rootfs" = 1 -a "$EMMC_ROOT_DEV" ] && {
+		[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && { dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 count=8; sync; }
+		export EMMC_ROOTFS_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/root -O | dd of="$EMMC_ROOT_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+		EMMC_ROOTFS_BLOCKS=$(((EMMC_ROOTFS_BLOCKS + 127) & ~127))
+		sync
+	}
+	[ "$has_dtb" = 1 -a "$EMMC_DTB_DEV" ] && export EMMC_DTB_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/dtb -O | dd of="$EMMC_DTB_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+	[ "$has_kernel" = 1 -a "$EMMC_KERN_DEV" ] && export EMMC_KERNEL_BLOCKS=$(($(tar x${gz}f "$tar_file" ${board_dir}/kernel -O | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+	if [ -z "$UPGRADE_BACKUP" ]; then
+		if [ "$EMMC_DATA_DEV" ]; then
+			dd if=/dev/zero of="$EMMC_DATA_DEV" bs=512 count=8
+		elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
+			dd if=/dev/zero of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS count=8
+		elif [ "$EMMC_KERNEL_BLOCKS" ]; then
+			dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
+		fi
+	fi
+}
+
+emmc_upgrade_fit() {
+	local fit_file="$1"
+	[ "$CI_KERNPART" -a -z "$EMMC_KERN_DEV" ] && export EMMC_KERN_DEV="$(find_mmc_part $CI_KERNPART $CI_ROOTDEV)"
+	if [ "$EMMC_KERN_DEV" ]; then
+		export EMMC_KERNEL_BLOCKS=$(($(get_image "$fit_file" | fwtool -i /dev/null -T - | dd of="$EMMC_KERN_DEV" bs=512 2>&1 | grep "records out" | cut -d' ' -f1)))
+		[ -z "$UPGRADE_BACKUP" ] && dd if=/dev/zero of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS count=8
+	fi
+}
+
+emmc_copy_config() {
+	if [ "$EMMC_DATA_DEV" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_DATA_DEV" bs=512
+	elif [ "$EMMC_ROOTFS_BLOCKS" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_ROOT_DEV" bs=512 seek=$EMMC_ROOTFS_BLOCKS
+	elif [ "$EMMC_KERNEL_BLOCKS" ]; then
+		dd if="$UPGRADE_BACKUP" of="$EMMC_KERN_DEV" bs=512 seek=$EMMC_KERNEL_BLOCKS
+	fi
+}
+
+emmc_do_upgrade() {
+	local file_type=$(identify_magic_long "$(get_magic_long "$1")")
+	case "$file_type" in
+		"fit") emmc_upgrade_fit $1;;
+		*) emmc_upgrade_tar $1;;
+	esac
+}
+EOF
+
+# Replace only the RE-SS-01 case. Keep the other Qualcomm eMMC boards on
+# their existing handlers.
 python3 - "$PLATFORM_SH" <<'PY'
-import re
-import sys
+import re, sys
 from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text()
-
-start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', text)
+p = Path(sys.argv[1])
+s = p.read_text()
+start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', s)
 if not start:
-    raise SystemExit('ERROR: JDCloud case not found')
-
-end = re.search(r'(?m)^\s*;;\s*$', text[start.end():])
+    raise SystemExit('ERROR: JDCloud RE-SS-01 case not found')
+end = re.search(r'(?m)^\s*;;\s*$', s[start.end():])
 if not end:
-    raise SystemExit('ERROR: JDCloud case terminator not found')
-
-replacement = '''\tjdcloud,re-cs-02|\\
-\tjdcloud,re-cs-07|\\
-\tjdcloud,re-ss-01|\\
-\tlink,nn6000-v1|\\
-\tlink,nn6000-v2)
-\t\tlocal cfgpart=$(find_mmc_part "0:BOOTCONFIG")
-\t\tpart_num="$(hexdump -e '1/1 "%01x|"' -n 1 -s 148 -C "$cfgpart" | cut -f 1 -d "|" | head -n1)"
-\t\tif [ "$part_num" -eq "1" ]; then
+    raise SystemExit('ERROR: JDCloud RE-SS-01 case terminator not found')
+replacement = '''\tjdcloud,re-ss-01)
+\t\tlocal cfgpart="$(find_mmc_part \"0:BOOTCONFIG\")"
+\t\tlocal part_num="$(hexdump -e '1/1 \"%01x|\"' -n 1 -s 148 -C \"$cfgpart\" | cut -f 1 -d \"|\" | head -n1)"
+\t\tif [ \"$part_num\" -eq 1 ]; then
 \t\t\tCI_KERNPART="0:HLOS_1"
 \t\t\tCI_ROOTPART="rootfs_1"
 \t\telse
@@ -76,42 +126,11 @@ replacement = '''\tjdcloud,re-cs-02|\\
 \t\tfi
 \t\temmc_do_upgrade "$1"
 \t\t;;'''
-
-text = text[:start.start()] + replacement + text[start.end() + end.end():]
-path.write_text(text)
+s = s[:start.start()] + replacement + s[start.end()+end.end():]
+p.write_text(s)
 PY
 
-# Verify the exact handler before compilation.
-python3 - "$PLATFORM_SH" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-text = Path(sys.argv[1]).read_text()
-m = re.search(r'(?ms)^\s*jdcloud,re-cs-02\|\\\n.*?^\s*;;\s*$', text)
-if not m:
-    raise SystemExit('ERROR: JDCloud eMMC block not found')
-block = m.group(0)
-for needle in (
-    'local cfgpart=$(find_mmc_part "0:BOOTCONFIG")',
-    'CI_KERNPART="0:HLOS_1"',
-    'CI_ROOTPART="rootfs_1"',
-    'CI_KERNPART="0:HLOS"',
-    'CI_ROOTPART="rootfs"',
-    'emmc_do_upgrade "$1"',
-):
-    if needle not in block:
-        raise SystemExit(f'ERROR: missing {needle}')
-if re.search(r'(?m)^\s*mmc_do_upgrade "\$1"', block):
-    raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
-print('RE-SS-01 eMMC upgrade handler: OK')
-PY
-
-# Clean profile: no optional LuCI apps or proxy cores.
-if [ -f include/target.mk ]; then
-    sed -i -E 's/ ?luci-app-[^ ]+//g' include/target.mk
-fi
-
+# Do not carry optional proxy/UI packages into the clean image.
 cat >> .config <<'EOF'
 
 CONFIG_PACKAGE_luci-app-advancedplus=n

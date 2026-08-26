@@ -102,7 +102,7 @@ for needle in (
 ):
     if needle not in block:
         raise SystemExit(f'ERROR: missing {needle}')
-if 'mmc_do_upgrade "$1"' in block:
+if re.search(r'(?m)^\s*mmc_do_upgrade "\$1"', block):
     raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
 print('RE-SS-01 eMMC upgrade handler: OK')
 PY

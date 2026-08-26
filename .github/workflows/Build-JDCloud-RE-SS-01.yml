@@ -81,7 +81,7 @@ jobs:
           PLATFORM="target/linux/qualcommax/ipq60xx/base-files/lib/upgrade/platform.sh"
           test -f files/lib/upgrade/emmc.sh
           grep -q 'emmc_do_upgrade' files/lib/upgrade/emmc.sh
-          grep -q 'jdcloud,re-ss-01' "$PLATFORM"
+          grep -q '^\s*jdcloud,re-ss-01)' "$PLATFORM"
 
           python3 - "$PLATFORM" <<'PY'
           import re
@@ -89,21 +89,25 @@ jobs:
           from pathlib import Path
 
           text = Path(sys.argv[1]).read_text()
-          start = re.search(r'(?m)^\s*jdcloud,re-ss-01\|\\\n', text)
+          start = re.search(r'(?m)^\s*jdcloud,re-ss-01\)\s*$', text)
           if not start:
               raise SystemExit('ERROR: JDCloud eMMC block not found')
           end = re.search(r'(?m)^\s*;;\s*$', text[start.end():])
           if not end:
               raise SystemExit('ERROR: JDCloud eMMC block terminator not found')
           block = text[start.start():start.end() + end.end()]
-          if 'emmc_do_upgrade "$1"' not in block:
-              raise SystemExit('ERROR: JDCloud block is not using emmc_do_upgrade')
+          required = (
+              'CI_KERNPART="0:HLOS_1"',
+              'CI_ROOTPART="rootfs_1"',
+              'CI_KERNPART="0:HLOS"',
+              'CI_ROOTPART="rootfs"',
+              'emmc_do_upgrade "$1"',
+          )
+          for needle in required:
+              if needle not in block:
+                  raise SystemExit(f'ERROR: missing {needle}')
           if re.search(r'(?m)^\s*mmc_do_upgrade "\$1"', block):
               raise SystemExit('ERROR: stale mmc_do_upgrade handler remains in JDCloud block')
-          if 'CI_KERNPART="0:HLOS_1"' not in block or 'CI_ROOTPART="rootfs_1"' not in block:
-              raise SystemExit('ERROR: inactive-slot mapping missing')
-          if 'CI_KERNPART="0:HLOS"' not in block or 'CI_ROOTPART="rootfs"' not in block:
-              raise SystemExit('ERROR: active-slot mapping missing')
           print('RE-SS-01 eMMC upgrade handler: OK')
           PY
           echo 'emmc.sh: OK'
